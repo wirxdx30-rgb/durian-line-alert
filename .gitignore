@@ -1,0 +1,6 @@
+node_modules
+.env
+data
+*.log
+line_backend
+pubspec.yaml
