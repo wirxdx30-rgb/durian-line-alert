@@ -1,1139 +1,721 @@
+'use strict';
+
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
 const express = require('express');
 const cors = require('cors');
-const axios = require('axios');
-const cron = require('node-cron');
-const fs = require('fs/promises');
-const path = require('path');
-
-require('dotenv').config();
 
 const app = express();
 
-app.use(cors());
-app.use(express.json({ limit: '1mb' }));
+const PORT = Number(process.env.PORT || 8080);
+const DATA_DIR = process.env.DATA_DIR || '/data';
+const DATA_FILE = path.join(DATA_DIR, 'alert-state.json');
 
-const PORT = process.env.PORT || 3000;
-
-const LINE_TOKEN =
+const LINE_CHANNEL_SECRET =
+  process.env.LINE_CHANNEL_SECRET || '';
+const LINE_CHANNEL_ACCESS_TOKEN =
   process.env.LINE_CHANNEL_ACCESS_TOKEN || '';
-
-const LINE_USER_ID =
-  process.env.LINE_USER_ID || '';
-
 const SYNC_API_KEY =
   process.env.SYNC_API_KEY || '';
 
-const DATA_DIR =
-  process.env.DATA_DIR ||
-  process.env.RAILWAY_VOLUME_MOUNT_PATH ||
-  path.join(__dirname, 'data');
+const LINK_CODE_TTL_MS = 15 * 60 * 1000;
 
-const STATE_FILE = path.join(
-  DATA_DIR,
-  'alert-state.json',
-);
+fs.mkdirSync(DATA_DIR, { recursive: true });
 
-// แจ้งเฉพาะอากาศรุนแรง
-const SEVERE_WIND_SPEED = 40;
-const SEVERE_WIND_GUST = 60;
-const SEVERE_RAIN_AMOUNT = 15;
-const SEVERE_RAIN_PROBABILITY = 80;
-
-// ตรวจอากาศล่วงหน้า 6 ชั่วโมง
-const FORECAST_HOURS_AHEAD = 6;
-
-let weatherCheckInProgress = false;
-
-let state = {
-  gardens: [],
-  lastAutomaticAlertDate: '',
-};
-
-function normalizeGardens(items) {
-  if (!Array.isArray(items)) {
-    return [];
-  }
-
-  const usedIds = new Set();
-
-  return items
-    .map((item, index) => {
-      const latitude = Number(
-        item.latitude,
-      );
-
-      const longitude = Number(
-        item.longitude,
-      );
-
-      if (
-        !Number.isFinite(latitude) ||
-        !Number.isFinite(longitude)
-      ) {
-        return null;
-      }
-
-      if (
-        latitude < -90 ||
-        latitude > 90 ||
-        longitude < -180 ||
-        longitude > 180
-      ) {
-        return null;
-      }
-
-      let id = String(
-        item.id ||
-          `garden_${Date.now()}_${index}`,
-      ).trim();
-
-      if (!id) {
-        id =
-          `garden_${Date.now()}_${index}`;
-      }
-
-      if (usedIds.has(id)) {
-        id = `${id}_${index}`;
-      }
-
-      usedIds.add(id);
-
-      const name = String(
-        item.name ||
-          `สวนลำดับที่ ${index + 1}`,
-      ).trim();
-
-      const address = String(
-        item.address ||
-          item.location ||
-          '',
-      ).trim();
-
-      return {
-        id,
-        name,
-        address,
-        latitude,
-        longitude,
-      };
-    })
-    .filter(Boolean);
+function defaultState() {
+  return {
+    gardens: [],
+    gardensByAccount: {},
+    lineLinks: {},
+    pendingLineCodes: {},
+    alertHistory: [],
+    lastAutoAlertByAccount: {},
+  };
 }
 
-function parseInitialGardens() {
+function loadState() {
   try {
+    if (!fs.existsSync(DATA_FILE)) {
+      return defaultState();
+    }
+
     const parsed = JSON.parse(
-      process.env.GARDENS_JSON || '[]',
+      fs.readFileSync(DATA_FILE, 'utf8'),
     );
 
-    return normalizeGardens(parsed);
+    return {
+      ...defaultState(),
+      ...parsed,
+      gardensByAccount:
+        parsed.gardensByAccount || {},
+      lineLinks:
+        parsed.lineLinks || {},
+      pendingLineCodes:
+        parsed.pendingLineCodes || {},
+      alertHistory:
+        Array.isArray(parsed.alertHistory)
+          ? parsed.alertHistory
+          : [],
+      lastAutoAlertByAccount:
+        parsed.lastAutoAlertByAccount || {},
+    };
   } catch (error) {
-    console.error(
-      'GARDENS_JSON ไม่ถูกต้อง:',
-      error.message,
-    );
-
-    return [];
+    console.error('LOAD STATE ERROR:', error);
+    return defaultState();
   }
 }
 
-async function saveState() {
-  await fs.mkdir(DATA_DIR, {
-    recursive: true,
-  });
+let state = loadState();
 
-  const temporaryFile =
-    `${STATE_FILE}.tmp`;
+function saveState() {
+  const tempFile = `${DATA_FILE}.tmp`;
 
-  const content = JSON.stringify(
-    state,
-    null,
-    2,
-  );
-
-  await fs.writeFile(
-    temporaryFile,
-    content,
+  fs.writeFileSync(
+    tempFile,
+    JSON.stringify(state, null, 2),
     'utf8',
   );
 
-  await fs.rename(
-    temporaryFile,
-    STATE_FILE,
-  );
+  fs.renameSync(tempFile, DATA_FILE);
 }
 
-async function loadState() {
-  try {
-    await fs.mkdir(DATA_DIR, {
-      recursive: true,
-    });
-
-    const content = await fs.readFile(
-      STATE_FILE,
-      'utf8',
-    );
-
-    const savedState =
-      JSON.parse(content);
-
-    state = {
-      gardens: normalizeGardens(
-        savedState.gardens,
-      ),
-      lastAutomaticAlertDate:
-        typeof savedState
-          .lastAutomaticAlertDate ===
-        'string'
-          ? savedState
-              .lastAutomaticAlertDate
-          : '',
-    };
-
-    console.log(
-      `โหลดข้อมูลเดิม ${state.gardens.length} สวน`,
-    );
-  } catch (error) {
-    if (error.code !== 'ENOENT') {
-      console.error(
-        'อ่านไฟล์สถานะไม่สำเร็จ:',
-        error.message,
-      );
-    }
-
-    state = {
-      gardens: parseInitialGardens(),
-      lastAutomaticAlertDate: '',
-    };
-
-    await saveState();
-
-    console.log(
-      `สร้างไฟล์สถานะใหม่ ${state.gardens.length} สวน`,
-    );
-  }
+function cleanPhone(value) {
+  return String(value || '')
+    .replace(/[^0-9A-Za-z]/g, '')
+    .trim();
 }
 
-async function reloadState() {
-  try {
-    const content = await fs.readFile(
-      STATE_FILE,
-      'utf8',
-    );
-
-    const savedState =
-      JSON.parse(content);
-
-    state = {
-      gardens: normalizeGardens(
-        savedState.gardens,
-      ),
-      lastAutomaticAlertDate:
-        typeof savedState
-          .lastAutomaticAlertDate ===
-        'string'
-          ? savedState
-              .lastAutomaticAlertDate
-          : '',
-    };
-  } catch (_) {
-    // ถ้าอ่านไม่ได้ ให้ใช้ค่าในหน่วยความจำ
-  }
+function jsonError(res, status, message) {
+  return res.status(status).json({
+    ok: false,
+    error: message,
+  });
 }
 
-function verifySyncKey(
-  req,
-  res,
-  next,
-) {
+function requireSyncKey(req, res, next) {
   if (!SYNC_API_KEY) {
-    return next();
+    return jsonError(
+      res,
+      500,
+      'SYNC_API_KEY ยังไม่ได้ตั้งค่า',
+    );
   }
 
-  const receivedKey =
-    req.headers['x-sync-key'];
+  const key = req.get('x-sync-key') || '';
 
-  if (receivedKey !== SYNC_API_KEY) {
-    return res.status(401).json({
-      success: false,
-      message:
-        'ไม่มีสิทธิ์ซิงก์ข้อมูลสวน',
-    });
+  if (
+    !crypto.timingSafeEqual(
+      Buffer.from(key),
+      Buffer.from(SYNC_API_KEY),
+    )
+  ) {
+    return jsonError(
+      res,
+      401,
+      'รหัสเชื่อมต่อไม่ถูกต้อง',
+    );
   }
 
   next();
 }
 
-async function sendLineMessage(text) {
-  if (!LINE_TOKEN) {
+async function pushLineMessage(userId, text) {
+  if (!LINE_CHANNEL_ACCESS_TOKEN) {
     throw new Error(
-      'ยังไม่ได้ตั้ง LINE_CHANNEL_ACCESS_TOKEN',
+      'LINE_CHANNEL_ACCESS_TOKEN ยังไม่ได้ตั้งค่า',
     );
   }
 
-  if (
-    !LINE_USER_ID ||
-    !LINE_USER_ID.startsWith('U')
-  ) {
-    throw new Error(
-      'LINE_USER_ID ไม่ถูกต้อง',
-    );
-  }
-
-  await axios.post(
+  const response = await fetch(
     'https://api.line.me/v2/bot/message/push',
     {
-      to: LINE_USER_ID,
-      messages: [
-        {
-          type: 'text',
-          text,
-        },
-      ],
-    },
-    {
+      method: 'POST',
       headers: {
         Authorization:
-          `Bearer ${LINE_TOKEN}`,
-        'Content-Type':
-          'application/json',
+          `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
       },
-      timeout: 20000,
-    },
-  );
-}
-
-function getThailandDateKey(
-  date = new Date(),
-) {
-  const parts =
-    new Intl.DateTimeFormat(
-      'en-US',
-      {
-        timeZone: 'Asia/Bangkok',
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-      },
-    ).formatToParts(date);
-
-  const year =
-    parts.find(
-      (item) => item.type === 'year',
-    )?.value;
-
-  const month =
-    parts.find(
-      (item) => item.type === 'month',
-    )?.value;
-
-  const day =
-    parts.find(
-      (item) => item.type === 'day',
-    )?.value;
-
-  return `${year}-${month}-${day}`;
-}
-
-function formatThaiDate(date) {
-  return new Intl.DateTimeFormat(
-    'th-TH',
-    {
-      timeZone: 'Asia/Bangkok',
-      day: 'numeric',
-      month: 'long',
-      year: 'numeric',
-    },
-  ).format(date);
-}
-
-function formatThaiTime(date) {
-  return new Intl.DateTimeFormat(
-    'th-TH',
-    {
-      timeZone: 'Asia/Bangkok',
-      hour: '2-digit',
-      minute: '2-digit',
-      hour12: false,
-    },
-  ).format(date);
-}
-
-async function getForecast(garden) {
-  const response = await axios.get(
-    'https://api.open-meteo.com/v1/forecast',
-    {
-      params: {
-        latitude: garden.latitude,
-        longitude: garden.longitude,
-
-        hourly: [
-          'precipitation_probability',
-          'precipitation',
-          'rain',
-          'showers',
-          'wind_speed_10m',
-          'wind_gusts_10m',
-          'weather_code',
-        ].join(','),
-
-        timezone: 'Asia/Bangkok',
-        forecast_days: 2,
-      },
-
-      timeout: 20000,
+      body: JSON.stringify({
+        to: userId,
+        messages: [
+          {
+            type: 'text',
+            text: String(text).slice(0, 5000),
+          },
+        ],
+      }),
     },
   );
 
-  return response.data;
+  if (!response.ok) {
+    const body = await response.text();
+
+    throw new Error(
+      `LINE API ${response.status}: ${body}`,
+    );
+  }
 }
 
-function numberAt(
-  hourly,
-  field,
-  index,
-) {
-  return Number(
-    hourly?.[field]?.[index] ?? 0,
-  );
-}
-
-function findSevereWeather(data) {
-  const hourly = data?.hourly;
-
-  if (
-    !hourly ||
-    !Array.isArray(hourly.time)
-  ) {
-    return null;
+async function replyLineMessage(replyToken, text) {
+  if (!replyToken) {
+    return;
   }
 
+  const response = await fetch(
+    'https://api.line.me/v2/bot/message/reply',
+    {
+      method: 'POST',
+      headers: {
+        Authorization:
+          `Bearer ${LINE_CHANNEL_ACCESS_TOKEN}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        replyToken,
+        messages: [
+          {
+            type: 'text',
+            text: String(text).slice(0, 5000),
+          },
+        ],
+      }),
+    },
+  );
+
+  if (!response.ok) {
+    const body = await response.text();
+    console.error(
+      'LINE REPLY ERROR:',
+      response.status,
+      body,
+    );
+  }
+}
+
+function verifyLineSignature(rawBody, signature) {
+  if (
+    !LINE_CHANNEL_SECRET ||
+    !signature ||
+    !rawBody
+  ) {
+    return false;
+  }
+
+  const expected = crypto
+    .createHmac(
+      'sha256',
+      LINE_CHANNEL_SECRET,
+    )
+    .update(rawBody)
+    .digest('base64');
+
+  const receivedBuffer =
+    Buffer.from(signature);
+  const expectedBuffer =
+    Buffer.from(expected);
+
+  return (
+    receivedBuffer.length ===
+      expectedBuffer.length &&
+    crypto.timingSafeEqual(
+      receivedBuffer,
+      expectedBuffer,
+    )
+  );
+}
+
+function cleanupExpiredCodes() {
   const now = Date.now();
-  const severeEvents = [];
 
   for (
-    let index = 0;
-    index < hourly.time.length;
-    index++
+    const [code, item]
+    of Object.entries(state.pendingLineCodes)
   ) {
-    const forecastTime = new Date(
-      hourly.time[index],
-    );
+    if (
+      !item ||
+      Number(item.expiresAt || 0) <= now
+    ) {
+      delete state.pendingLineCodes[code];
+    }
+  }
+}
+
+function createLinkCode() {
+  const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    let code = 'DUR-';
+
+    for (let index = 0; index < 6; index++) {
+      code += chars[
+        crypto.randomInt(0, chars.length)
+      ];
+    }
+
+    if (!state.pendingLineCodes[code]) {
+      return code;
+    }
+  }
+
+  throw new Error(
+    'ไม่สามารถสร้างรหัสเชื่อมต่อได้',
+  );
+}
+
+app.use(cors({
+  origin: '*',
+  methods: ['GET', 'POST', 'OPTIONS'],
+  allowedHeaders: [
+    'Content-Type',
+    'Accept',
+    'x-sync-key',
+    'x-line-signature',
+  ],
+}));
+
+// ต้องประกาศ Webhook ก่อน express.json()
+// เพื่อเก็บ raw body สำหรับตรวจลายเซ็น LINE
+app.post(
+  '/line/webhook',
+  express.raw({
+    type: 'application/json',
+    limit: '1mb',
+  }),
+  async (req, res) => {
+    const rawBody = req.body;
+    const signature =
+      req.get('x-line-signature') || '';
 
     if (
-      Number.isNaN(
-        forecastTime.getTime(),
+      !verifyLineSignature(
+        rawBody,
+        signature,
       )
     ) {
-      continue;
+      return jsonError(
+        res,
+        401,
+        'LINE signature ไม่ถูกต้อง',
+      );
     }
 
-    const hoursAhead =
-      (
-        forecastTime.getTime() -
-        now
-      ) /
-      3600000;
+    let payload;
 
-    if (
-      hoursAhead < 0 ||
-      hoursAhead >
-        FORECAST_HOURS_AHEAD
-    ) {
-      continue;
+    try {
+      payload = JSON.parse(
+        rawBody.toString('utf8'),
+      );
+    } catch (_) {
+      return jsonError(
+        res,
+        400,
+        'รูปแบบ Webhook ไม่ถูกต้อง',
+      );
     }
 
-    const weatherCode = numberAt(
-      hourly,
-      'weather_code',
-      index,
-    );
+    // ตอบ 200 ให้ LINE ก่อน
+    res.status(200).json({ ok: true });
 
-    const windSpeed = numberAt(
-      hourly,
-      'wind_speed_10m',
-      index,
-    );
+    cleanupExpiredCodes();
 
-    const windGust = numberAt(
-      hourly,
-      'wind_gusts_10m',
-      index,
-    );
-
-    const rainProbability = numberAt(
-      hourly,
-      'precipitation_probability',
-      index,
-    );
-
-    const precipitation = numberAt(
-      hourly,
-      'precipitation',
-      index,
-    );
-
-    const rain = numberAt(
-      hourly,
-      'rain',
-      index,
-    );
-
-    const showers = numberAt(
-      hourly,
-      'showers',
-      index,
-    );
-
-    const rainAmount = Math.max(
-      precipitation,
-      rain,
-      showers,
-    );
-
-    const isThunderstorm =
-      weatherCode >= 95 &&
-      weatherCode <= 99;
-
-    const isSevereWind =
-      windSpeed >=
-      SEVERE_WIND_SPEED;
-
-    const isSevereGust =
-      windGust >=
-      SEVERE_WIND_GUST;
-
-    const isHeavyRain =
-      rainAmount >=
-        SEVERE_RAIN_AMOUNT &&
-      rainProbability >=
-        SEVERE_RAIN_PROBABILITY;
-
-    if (
-      !isThunderstorm &&
-      !isSevereWind &&
-      !isSevereGust &&
-      !isHeavyRain
-    ) {
-      continue;
-    }
-
-    let type =
-      'สภาพอากาศรุนแรง';
-
-    let icon = '🚨';
-
-    if (isThunderstorm) {
-      type = 'พายุฝนฟ้าคะนอง';
-      icon = '⛈️';
-    } else if (
-      isSevereWind ||
-      isSevereGust
-    ) {
-      type = 'ลมแรงจัด';
-      icon = '💨';
-    } else if (isHeavyRain) {
-      type = 'ฝนตกหนักจัด';
-      icon = '🌧️';
-    }
-
-    let score = 0;
-
-    if (isThunderstorm) {
-      score += 1000;
-    }
-
-    score += windGust * 3;
-    score += windSpeed * 2;
-    score += rainAmount * 10;
-    score += rainProbability;
-
-    severeEvents.push({
-      time: forecastTime,
-      type,
-      icon,
-      weatherCode,
-      windSpeed,
-      windGust,
-      rainProbability,
-      rainAmount,
-      isThunderstorm,
-      isSevereWind,
-      isSevereGust,
-      isHeavyRain,
-      score,
-    });
-  }
-
-  if (severeEvents.length === 0) {
-    return null;
-  }
-
-  severeEvents.sort(
-    (first, second) =>
-      second.score - first.score,
-  );
-
-  return severeEvents[0];
-}
-
-function buildSevereMessage(
-  severeGardens,
-) {
-  const sections =
-    severeGardens.map(
-      ({ garden, event }) => {
-        const advice = [];
-
-        if (
-          event.isThunderstorm ||
-          event.isSevereWind ||
-          event.isSevereGust
-        ) {
-          advice.push(
-            '• ตรวจเชือกพยุงกิ่งและผลทุเรียน',
-          );
-
-          advice.push(
-            '• เก็บอุปกรณ์ที่อาจปลิวออกจากสวน',
-          );
-        }
-
-        if (
-          event.isThunderstorm ||
-          event.isHeavyRain
-        ) {
-          advice.push(
-            '• ตรวจทางระบายน้ำไม่ให้อุดตัน',
-          );
-
-          advice.push(
-            '• งดพ่นยาและงดใส่ปุ๋ยชั่วคราว',
-          );
-        }
-
-        if (advice.length === 0) {
-          advice.push(
-            '• หลีกเลี่ยงการทำงานกลางแจ้ง',
-          );
-        }
-
-        return [
-          `${event.icon} ${event.type}`,
-          `📍 ${garden.name}`,
-          garden.address
-            ? `🗺️ ${garden.address}`
-            : null,
-          `🕒 คาดว่าประมาณ ${formatThaiTime(
-            event.time,
-          )} น.`,
-          `🌧️ ฝน ${event.rainAmount.toFixed(
-            1,
-          )} มม./ชม.`,
-          `☔ โอกาสฝน ${Math.round(
-            event.rainProbability,
-          )}%`,
-          `💨 ลม ${Math.round(
-            event.windSpeed,
-          )} กม./ชม.`,
-          `🌪️ ลมกระโชก ${Math.round(
-            event.windGust,
-          )} กม./ชม.`,
-          '',
-          '🧺 คำแนะนำ',
-          ...advice,
-        ]
-          .filter(
-            (item) => item !== null,
-          )
-          .join('\n');
-      },
-    );
-
-  return [
-    '🚨 แจ้งเตือนอากาศรุนแรง',
-    `📅 ${formatThaiDate(
-      new Date(),
-    )}`,
-    '',
-    sections.join(
-      '\n\n────────────\n\n',
-    ),
-    '',
-    'ระบบแจ้งอัตโนมัติสูงสุดวันละ 1 ครั้ง',
-    'ฝนหรือลมทั่วไปจะไม่แจ้งเตือนค่ะ 🌿',
-  ].join('\n');
-}
-
-function buildManualMessage(body) {
-  const garden =
-    body.garden || 'สวนของคุณ';
-
-  const title =
-    body.title || 'แจ้งเตือนจากแอป';
-
-  return [
-    '🌿 DURIAN CLIMATE ALERT',
-    '',
-    `📍 ${garden}`,
-    `⚠️ ${title}`,
-    body.description
-      ? `\n📝 ${body.description}`
-      : '',
-    body.temperature
-      ? `\n🌡️ อุณหภูมิ ${body.temperature}`
-      : '',
-    body.humidity
-      ? `\n💧 ความชื้น ${body.humidity}`
-      : '',
-    body.rain
-      ? `\n☔ โอกาสฝน ${body.rain}`
-      : '',
-    body.wind
-      ? `\n💨 ความเร็วลม ${body.wind}`
-      : '',
-    body.advice
-      ? `\n\n🧺 คำแนะนำ\n${body.advice}`
-      : '',
-  ].join('\n');
-}
-
-async function checkSevereWeather() {
-  if (weatherCheckInProgress) {
-    return {
-      checked: 0,
-      sent: 0,
-      message:
-        'ระบบกำลังตรวจอากาศอยู่',
-    };
-  }
-
-  weatherCheckInProgress = true;
-
-  try {
-    await reloadState();
-
-    const todayKey =
-      getThailandDateKey();
-
-    if (
-      state.lastAutomaticAlertDate ===
-      todayKey
-    ) {
-      return {
-        checked:
-          state.gardens.length,
-        sent: 0,
-        alreadySentToday: true,
-        message:
-          'วันนี้ส่งแจ้งเตือนแล้ว',
-      };
-    }
-
-    if (state.gardens.length === 0) {
-      return {
-        checked: 0,
-        sent: 0,
-        alreadySentToday: false,
-        message:
-          'ยังไม่มีสวนในระบบ',
-      };
-    }
-
-    const severeGardens = [];
-
-    for (
-      const garden of state.gardens
-    ) {
+    for (const event of payload.events || []) {
       try {
-        const forecast =
-          await getForecast(garden);
+        const userId =
+          event?.source?.userId || '';
 
-        const severeEvent =
-          findSevereWeather(
-            forecast,
+        if (!userId) {
+          continue;
+        }
+
+        if (
+          event.type === 'message' &&
+          event.message?.type === 'text'
+        ) {
+          const text = String(
+            event.message.text || '',
+          )
+            .trim()
+            .toUpperCase();
+
+          const pending =
+            state.pendingLineCodes[text];
+
+          if (
+            pending &&
+            Number(pending.expiresAt) >
+              Date.now()
+          ) {
+            const phone =
+              cleanPhone(pending.phone);
+
+            state.lineLinks[phone] = {
+              userId,
+              linkedAt:
+                new Date().toISOString(),
+            };
+
+            delete state.pendingLineCodes[text];
+            saveState();
+
+            await replyLineMessage(
+              event.replyToken,
+              'เชื่อมต่อ Durian Alert สำเร็จแล้ว ✅\n'
+                + 'จากนี้คุณจะรับการแจ้งเตือนสภาพอากาศของสวนผ่าน LINE ได้',
+            );
+
+            continue;
+          }
+
+          if (
+            text === 'สถานะ' ||
+            text === 'STATUS'
+          ) {
+            const linkedPhone =
+              Object.entries(state.lineLinks)
+                .find(
+                  ([, item]) =>
+                    item?.userId === userId,
+                )?.[0];
+
+            await replyLineMessage(
+              event.replyToken,
+              linkedPhone
+                ? `LINE นี้เชื่อมต่อกับบัญชี ${linkedPhone} แล้ว ✅`
+                : 'LINE นี้ยังไม่ได้เชื่อมต่อกับแอป Durian Alert',
+            );
+
+            continue;
+          }
+
+          await replyLineMessage(
+            event.replyToken,
+            'กรุณาส่งรหัสเชื่อมต่อที่ขึ้นต้นด้วย DUR- จากแอป Durian Alert',
           );
+        }
 
-        if (severeEvent) {
-          severeGardens.push({
-            garden,
-            event: severeEvent,
-          });
-
-          console.log(
-            `${garden.name}: พบอากาศรุนแรง`,
-          );
-        } else {
-          console.log(
-            `${garden.name}: อากาศไม่รุนแรง`,
+        if (event.type === 'follow') {
+          await replyLineMessage(
+            event.replyToken,
+            'ขอบคุณที่เพิ่มเพื่อน 🌿\n'
+              + 'กลับไปที่แอป Durian Alert กดเชื่อมต่อ LINE แล้วส่งรหัส DUR-xxxxxx มาที่แชตนี้',
           );
         }
       } catch (error) {
         console.error(
-          `ตรวจสวน ${garden.name} ไม่สำเร็จ:`,
-          error.response?.data ||
-            error.message,
+          'WEBHOOK EVENT ERROR:',
+          error,
         );
       }
     }
+  },
+);
 
-    if (severeGardens.length === 0) {
-      return {
-        checked:
-          state.gardens.length,
-        sent: 0,
-        alreadySentToday: false,
-        severeGardenCount: 0,
-        message:
-          'ไม่พบอากาศรุนแรง',
-      };
-    }
-
-    await reloadState();
-
-    if (
-      state.lastAutomaticAlertDate ===
-      todayKey
-    ) {
-      return {
-        checked:
-          state.gardens.length,
-        sent: 0,
-        alreadySentToday: true,
-        message:
-          'มีคำสั่งอื่นส่งวันนี้ไปแล้ว',
-      };
-    }
-
-    await sendLineMessage(
-      buildSevereMessage(
-        severeGardens,
-      ),
-    );
-
-    state.lastAutomaticAlertDate =
-      todayKey;
-
-    await saveState();
-
-    return {
-      checked:
-        state.gardens.length,
-      sent: 1,
-      alreadySentToday: false,
-      severeGardenCount:
-        severeGardens.length,
-      message:
-        'ส่งแจ้งเตือนอากาศรุนแรงแล้ว',
-    };
-  } finally {
-    weatherCheckInProgress = false;
-  }
-}
+app.use(express.json({
+  limit: '1mb',
+}));
 
 app.get('/', (req, res) => {
   res.json({
-    success: true,
-    service:
-      'Durian Climate Alert',
-
-    gardenCount:
-      state.gardens.length,
-
-    gardens:
-      state.gardens.map(
-        (garden) => ({
-          id: garden.id,
-          name: garden.name,
-          address: garden.address,
-          latitude:
-            garden.latitude,
-          longitude:
-            garden.longitude,
-        }),
-      ),
-
-    automaticAlert:
-      'สูงสุดวันละ 1 ครั้ง',
-
-    forecastHoursAhead:
-      FORECAST_HOURS_AHEAD,
-
-    lastAutomaticAlertDate:
-      state.lastAutomaticAlertDate ||
-      null,
-
-    severeThresholds: {
-      windSpeed:
-        `${SEVERE_WIND_SPEED} km/h`,
-      windGust:
-        `${SEVERE_WIND_GUST} km/h`,
-      heavyRain:
-        `${SEVERE_RAIN_AMOUNT} mm/h`,
-      rainProbability:
-        `${SEVERE_RAIN_PROBABILITY}%`,
-      thunderstormCode:
-        '95-99',
-    },
-
-    routes: [
-      'GET /',
-      'GET /gardens',
-      'POST /sync-gardens',
-      'POST /send-test-line',
-      'POST /send-line-alert',
-      'POST /check-rain-now',
-    ],
+    ok: true,
+    service: 'durian-line-alert',
+    version: '2.0.0',
+    lineConfigured: Boolean(
+      LINE_CHANNEL_SECRET &&
+      LINE_CHANNEL_ACCESS_TOKEN,
+    ),
+    dataFile: DATA_FILE,
   });
+});
+
+app.get('/health', (req, res) => {
+  res.json({
+    ok: true,
+    time: new Date().toISOString(),
+  });
+});
+
+app.post('/line/link-code', (req, res) => {
+  const phone =
+    cleanPhone(req.body?.phone);
+
+  if (!phone) {
+    return jsonError(
+      res,
+      400,
+      'กรุณาระบุเบอร์โทร',
+    );
+  }
+
+  cleanupExpiredCodes();
+
+  // ลบรหัสเก่าของบัญชีเดียวกัน
+  for (
+    const [code, item]
+    of Object.entries(state.pendingLineCodes)
+  ) {
+    if (
+      cleanPhone(item?.phone) === phone
+    ) {
+      delete state.pendingLineCodes[code];
+    }
+  }
+
+  const code = createLinkCode();
+
+  state.pendingLineCodes[code] = {
+    phone,
+    createdAt:
+      new Date().toISOString(),
+    expiresAt:
+      Date.now() + LINK_CODE_TTL_MS,
+  };
+
+  saveState();
+
+  res.json({
+    ok: true,
+    code,
+    expiresInSeconds:
+      Math.floor(LINK_CODE_TTL_MS / 1000),
+    lineOfficialAccountId:
+      process.env.LINE_OA_ID ||
+      '@943krgpw',
+  });
+});
+
+app.get('/line/status', (req, res) => {
+  const phone =
+    cleanPhone(req.query.phone);
+
+  if (!phone) {
+    return jsonError(
+      res,
+      400,
+      'กรุณาระบุเบอร์โทร',
+    );
+  }
+
+  const link = state.lineLinks[phone];
+
+  res.json({
+    ok: true,
+    connected: Boolean(link?.userId),
+    linkedAt: link?.linkedAt || null,
+  });
+});
+
+app.post('/line/test', async (req, res) => {
+  const phone =
+    cleanPhone(req.body?.phone);
+
+  if (!phone) {
+    return jsonError(
+      res,
+      400,
+      'กรุณาระบุเบอร์โทร',
+    );
+  }
+
+  const link = state.lineLinks[phone];
+
+  if (!link?.userId) {
+    return jsonError(
+      res,
+      404,
+      'บัญชีนี้ยังไม่ได้เชื่อมต่อ LINE',
+    );
+  }
+
+  try {
+    await pushLineMessage(
+      link.userId,
+      'ทดสอบแจ้งเตือนจาก Durian Alert สำเร็จ ✅\n'
+        + 'ระบบพร้อมส่งข้อมูลฝน ลม พายุ และความเสี่ยงของสวนแล้ว 🌿',
+    );
+
+    res.json({
+      ok: true,
+      message: 'ส่งข้อความทดสอบสำเร็จ',
+    });
+  } catch (error) {
+    console.error('LINE TEST ERROR:', error);
+
+    jsonError(
+      res,
+      502,
+      error.message ||
+        'ส่งข้อความ LINE ไม่สำเร็จ',
+    );
+  }
+});
+
+app.post('/line/disconnect', (req, res) => {
+  const phone =
+    cleanPhone(req.body?.phone);
+
+  if (!phone) {
+    return jsonError(
+      res,
+      400,
+      'กรุณาระบุเบอร์โทร',
+    );
+  }
+
+  delete state.lineLinks[phone];
+  saveState();
+
+  res.json({
+    ok: true,
+    connected: false,
+  });
+});
+
+// รองรับ Flutter รุ่นเดิมชั่วคราว
+app.post('/send-test-line', async (req, res) => {
+  const fallbackUserId =
+    process.env.LINE_USER_ID || '';
+
+  if (!fallbackUserId) {
+    return jsonError(
+      res,
+      400,
+      'ยังไม่มี LINE_USER_ID หรือบัญชีที่เชื่อมต่อ',
+    );
+  }
+
+  try {
+    await pushLineMessage(
+      fallbackUserId,
+      'ทดสอบระบบแจ้งเตือน Durian Alert สำเร็จ ✅',
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    jsonError(res, 502, error.message);
+  }
+});
+
+app.post('/send-line-alert', async (req, res) => {
+  const fallbackUserId =
+    process.env.LINE_USER_ID || '';
+
+  if (!fallbackUserId) {
+    return jsonError(
+      res,
+      400,
+      'ยังไม่มี LINE_USER_ID',
+    );
+  }
+
+  const body = req.body || {};
+
+  const message = [
+    '⚠️ แจ้งเตือนสภาพอากาศสวนทุเรียน',
+    body.garden
+      ? `สวน: ${body.garden}`
+      : null,
+    body.title
+      ? `เหตุการณ์: ${body.title}`
+      : null,
+    body.description || null,
+    body.advice
+      ? `คำแนะนำ: ${body.advice}`
+      : null,
+    body.temperature
+      ? `อุณหภูมิ: ${body.temperature}`
+      : null,
+    body.humidity
+      ? `ความชื้น: ${body.humidity}`
+      : null,
+    body.rain
+      ? `โอกาสฝน: ${body.rain}`
+      : null,
+    body.wind
+      ? `ลม: ${body.wind}`
+      : null,
+  ]
+    .filter(Boolean)
+    .join('\n');
+
+  try {
+    await pushLineMessage(
+      fallbackUserId,
+      message,
+    );
+
+    res.json({ ok: true });
+  } catch (error) {
+    jsonError(res, 502, error.message);
+  }
 });
 
 app.post(
   '/sync-gardens',
-  verifySyncKey,
-  async (req, res) => {
-    try {
-      const incomingGardens =
-        Array.isArray(req.body)
-          ? req.body
-          : req.body.gardens;
+  requireSyncKey,
+  (req, res) => {
+    const gardens =
+      Array.isArray(req.body?.gardens)
+        ? req.body.gardens
+        : [];
 
-      if (
-        !Array.isArray(
-          incomingGardens,
-        )
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              'ข้อมูล gardens ต้องเป็นรายการ',
-          });
-      }
+    const phone =
+      cleanPhone(req.body?.phone);
 
-      const normalized =
-        normalizeGardens(
-          incomingGardens,
-        );
-
-      if (
-        incomingGardens.length > 0 &&
-        normalized.length === 0
-      ) {
-        return res
-          .status(400)
-          .json({
-            success: false,
-            message:
-              'ข้อมูลพิกัดสวนไม่ถูกต้อง',
-          });
-      }
-
-      state.gardens = normalized;
-
-      await saveState();
-
-      console.log(
-        `ซิงก์สวนสำเร็จ ${state.gardens.length} สวน`,
-      );
-
-      res.json({
-        success: true,
-        gardenCount:
-          state.gardens.length,
-        gardens:
-          state.gardens,
-        message:
-          'ซิงก์รายชื่อสวนสำเร็จ',
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message:
-          'บันทึกรายชื่อสวนไม่สำเร็จ',
-        error: error.message,
-      });
+    if (phone) {
+      state.gardensByAccount[phone] =
+        gardens;
     }
+
+    // เก็บรูปแบบเก่าไว้เพื่อไม่ให้ระบบเดิมพัง
+    state.gardens = gardens;
+    saveState();
+
+    res.json({
+      ok: true,
+      gardenCount: gardens.length,
+    });
   },
 );
 
 app.get(
   '/gardens',
-  verifySyncKey,
+  requireSyncKey,
   (req, res) => {
+    const phone =
+      cleanPhone(req.query.phone);
+
+    const gardens =
+      phone
+        ? state.gardensByAccount[phone] || []
+        : state.gardens || [];
+
     res.json({
-      success: true,
-      gardenCount:
-        state.gardens.length,
-      gardens:
-        state.gardens,
+      ok: true,
+      gardens,
+      gardenCount: gardens.length,
     });
   },
 );
 
-app.post(
-  '/send-test-line',
-  async (req, res) => {
-    try {
-      await sendLineMessage(
-        [
-          '🌿 เชื่อมต่อ LINE สำเร็จ',
-          '',
-          'ระบบตั้งค่าเป็น',
-          '• แจ้งเฉพาะพายุฝนฟ้าคะนอง',
-          '• แจ้งเฉพาะลมแรงจัด',
-          '• แจ้งเฉพาะฝนตกหนักจัด',
-          '• แจ้งอัตโนมัติสูงสุดวันละ 1 ครั้ง',
-          '',
-          'ข้อความนี้เป็นข้อความทดสอบ',
-        ].join('\n'),
-      );
-
-      res.json({
-        success: true,
-        message:
-          'ส่งข้อความทดสอบสำเร็จ',
-      });
-    } catch (error) {
-      res
-        .status(
-          error.response?.status ||
-            500,
-        )
-        .json({
-          success: false,
-          message:
-            'ส่งข้อความทดสอบไม่สำเร็จ',
-          error:
-            error.response?.data ||
-            error.message,
-        });
-    }
-  },
-);
-
-app.post(
-  '/send-line-alert',
-  async (req, res) => {
-    try {
-      await sendLineMessage(
-        buildManualMessage(
-          req.body || {},
-        ),
-      );
-
-      res.json({
-        success: true,
-        message:
-          'ส่งข้อความด้วยตนเองสำเร็จ',
-      });
-    } catch (error) {
-      res
-        .status(
-          error.response?.status ||
-            500,
-        )
-        .json({
-          success: false,
-          message:
-            'ส่งข้อความไม่สำเร็จ',
-          error:
-            error.response?.data ||
-            error.message,
-        });
-    }
-  },
-);
-
-app.post(
-  '/check-rain-now',
-  async (req, res) => {
-    try {
-      const result =
-        await checkSevereWeather();
-
-      res.json({
-        success: true,
-        ...result,
-      });
-    } catch (error) {
-      res.status(500).json({
-        success: false,
-        message:
-          'ตรวจสภาพอากาศไม่สำเร็จ',
-        error:
-          error.response?.data ||
-          error.message,
-      });
-    }
-  },
-);
-
-// ตรวจทุก 30 นาที
-// แต่ส่งแจ้งเตือนสูงสุดวันละ 1 ครั้ง
-cron.schedule(
-  '*/30 * * * *',
-  async () => {
-    try {
-      const result =
-        await checkSevereWeather();
-
-      console.log(
-        new Date().toISOString(),
-        result.message,
-      );
-    } catch (error) {
-      console.error(
-        'Cron error:',
-        error.message,
-      );
-    }
-  },
-  {
-    timezone: 'Asia/Bangkok',
-  },
-);
-
-async function startServer() {
-  await loadState();
-
-  app.listen(PORT, () => {
-    console.log('');
-    console.log(
-      '================================',
-    );
-    console.log(
-      'DURIAN ALERT SERVER RUNNING',
-    );
-    console.log(
-      `PORT: ${PORT}`,
-    );
-    console.log(
-      `GARDENS: ${state.gardens.length}`,
-    );
-    console.log(
-      `DATA FILE: ${STATE_FILE}`,
-    );
-    console.log(
-      'AUTO ALERT: MAX 1 PER DAY',
-    );
-    console.log(
-      '================================',
-    );
-    console.log('');
+app.post('/check-rain-now', (req, res) => {
+  res.json({
+    ok: true,
+    message:
+      'ระบบตรวจอากาศอัตโนมัติจะเพิ่มในขั้นถัดไป',
   });
+});
 
-  // ไม่ตรวจทันทีตอนเปิดเซิร์ฟเวอร์
-  // ป้องกัน Deploy แล้วแจ้งซ้ำ
-}
-
-startServer().catch(
-  (error) => {
-    console.error(
-      'เปิด Server ไม่สำเร็จ:',
-      error,
-    );
-
-    process.exit(1);
-  },
-);
+app.listen(PORT, '0.0.0.0', () => {
+  console.log('DURIAN ALERT SERVER RUNNING');
+  console.log(`PORT: ${PORT}`);
+  console.log(`DATA FILE: ${DATA_FILE}`);
+  console.log(
+    `LINE CONFIGURED: ${
+      Boolean(
+        LINE_CHANNEL_SECRET &&
+        LINE_CHANNEL_ACCESS_TOKEN,
+      )
+    }`,
+  );
+});
